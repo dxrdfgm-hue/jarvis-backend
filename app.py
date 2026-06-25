@@ -174,6 +174,39 @@ def ask_deepseek(screen_text):
         print("[Firebase/AI]: Желі бұғатталған болуы мүмкін. Fallback ретінде DuckDuckGo AI-ге қосылудамыз...")
         return ask_duckduckgo(screen_text)
 
+import re
+
+def parse_ai_response(response_text):
+    # Regex to find SPEAK("...") or SPEAK(...)
+    speak_match = re.search(r'ACTION:\s*SPEAK\((["\']?)(.*?)\1\)', response_text, re.IGNORECASE | re.DOTALL)
+    if speak_match:
+        return "SPEAK", speak_match.group(2).strip()
+        
+    # Regex to find CLICK(x, y)
+    click_match = re.search(r'ACTION:\s*CLICK\(\s*([0-9.]+)\s*,\s*([0-9.]+)\s*\)', response_text, re.IGNORECASE)
+    if click_match:
+        try:
+            x = float(click_match.group(1))
+            y = float(click_match.group(2))
+            return "CLICK", (x, y)
+        except ValueError:
+            pass
+            
+    # If no ACTION format is matched, check if there's any speak fallback
+    clean_text = response_text
+    if "THOUGHT:" in clean_text:
+        lines = clean_text.split("\n")
+        clean_lines = [line for line in lines if not line.strip().upper().startswith("THOUGHT:")]
+        clean_text = "\n".join(clean_lines).strip()
+    
+    clean_text = re.sub(r'^ACTION:\s*', '', clean_text, flags=re.IGNORECASE).strip()
+    if (clean_text.startswith('"') and clean_text.endswith('"')) or (clean_text.startswith("'") and clean_text.endswith("'")):
+        clean_text = clean_text[1:-1].strip()
+        
+    if clean_text:
+        return "SPEAK", clean_text
+    return None, None
+
 # --- FIREBASE ЭКРАН ТЫҢДАУШЫСЫ (SCREEN MONITOR) ---
 def on_screen_text_change(event):
     if event.data:
@@ -186,6 +219,93 @@ try:
     print("[Firebase]: Экран тыңдаушысы сәтті қосылды.")
 except Exception as e:
     print("[Firebase Listener Error]:", e)
+
+# --- FIREBASE ДАУЫСТЫҚ КОМАНДА ТЫҢДАУШЫСЫ (VOICE COMMAND MONITOR) ---
+last_processed_voice_timestamp = int(time.time() * 1000)
+
+def on_voice_command_change(event):
+    global last_processed_voice_timestamp
+    if not event.data:
+        return
+    
+    try:
+        command_data = event.data
+        if not isinstance(command_data, dict):
+            return
+            
+        command = command_data.get("command", "").strip()
+        timestamp = command_data.get("timestamp", 0)
+        
+        # Жүйе іске қосылғаннан кейінгі жаңа командаларды ғана өңдейміз
+        if not command or timestamp <= last_processed_voice_timestamp:
+            return
+            
+        last_processed_voice_timestamp = timestamp
+        print(f"\n[Дауыстық команда келді]: {command}")
+        
+        # Экрандағы мәтінді контекст ретінде алу
+        screen_text = db.reference("current_screen_text").get()
+        context = ""
+        if screen_text:
+            context = f"[Телефон экранындағы ағымдағы мәтін: {screen_text}]\n"
+            
+        prompt = f"{context}[Пайдаланушының дауыстық командасы]: {command}"
+        ai_response = ask_deepseek(prompt)
+        
+        if ai_response:
+            print(f"[ИИ Жауабы]: {ai_response}")
+            action_type, action_val = parse_ai_response(ai_response)
+            
+            # Админ чат-идентификаторын Telegram-ға есеп беру үшін алу
+            admin_chat_id = db.reference("bot_config/admin_chat_id").get()
+            
+            if action_type == "SPEAK":
+                # Телефон дауыстап айтуы үшін базаға жазу
+                db.reference("commands/speak").set(action_val)
+                if admin_chat_id:
+                    bot.send_message(
+                        admin_chat_id, 
+                        f"🗣️ *Дауыстық команда:* {command}\n🤖 *Жарвистің жауабы:* {action_val}", 
+                        parse_mode="Markdown"
+                    )
+            elif action_type == "CLICK":
+                x, y = action_val
+                click_data = {
+                    "x": x,
+                    "y": y,
+                    "timestamp": int(time.time() * 1000)
+                }
+                db.reference("commands/last_click").set(click_data)
+                
+                # Дауыстап хабарлау
+                feedback = "Қазір басамын, бауырым."
+                db.reference("commands/speak").set(feedback)
+                
+                if admin_chat_id:
+                    bot.send_message(
+                        admin_chat_id, 
+                        f"🗣️ *Дауыстық команда:* {command}\n👆 *Әрекет:* Басу ({x}, {y})", 
+                        parse_mode="Markdown"
+                    )
+            else:
+                db.reference("commands/speak").set(ai_response)
+                if admin_chat_id:
+                    bot.send_message(
+                        admin_chat_id, 
+                        f"🗣️ *Дауыстық команда:* {command}\n🤖 *Жарвистің жауабы:* {ai_response}", 
+                        parse_mode="Markdown"
+                    )
+        else:
+            db.reference("commands/speak").set("Ақтөбеде байланыс нашар, бауыр.")
+    except Exception as e:
+        print("[Voice Command Listener Error]:", e)
+
+# Firebase-тегі дауыстық командаларды бақылауды қосу
+try:
+    db.reference("voice_commands").listen(on_voice_command_change)
+    print("[Firebase]: Дауыстық команда тыңдаушысы сәтті қосылды.")
+except Exception as e:
+    print("[Firebase Voice Listener Error]:", e)
 
 # --- СЕЛФИ СУРЕТТЕРДІ БАҚЫЛАУ (ӨШІРІЛДІ - ЕНДІ СУРЕТТЕР ТІКЕЛЕЙ ТЕЛЕФОННАН КЕЛЕДІ) ---
 # Бұрын Storage бақылайтын, қазір телефоннан тікелей Telegram-ға келетіндіктен бұл функция қажет емес.
@@ -302,7 +422,22 @@ def echo_all(message):
     ai_response = ask_deepseek(f"{context}[Пайдаланушы хабарламасы]: {user_text}")
     try:
         if ai_response:
-            bot.reply_to(message, ai_response)
+            action_type, action_val = parse_ai_response(ai_response)
+            if action_type == "SPEAK":
+                bot.reply_to(message, action_val)
+            elif action_type == "CLICK":
+                x, y = action_val
+                click_data = {
+                    "x": x,
+                    "y": y,
+                    "timestamp": int(time.time() * 1000)
+                }
+                db.reference("commands/last_click").set(click_data)
+                bot.reply_to(message, f"👆 *Әрекет басталды:* Экрандағы ({x}, {y}) координаттары басылуда...")
+                # Телефонға да дыбыстық белгі беру
+                db.reference("commands/speak").set("Қазір басамын, бауырым.")
+            else:
+                bot.reply_to(message, ai_response)
         else:
             bot.reply_to(message, "Ақтөбеде байланыс нашар болып тұр, бауырым. Сәлден кейін қайталашы.")
     except Exception as e:
