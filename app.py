@@ -5,6 +5,7 @@ import requests
 import telebot
 import firebase_admin
 from firebase_admin import credentials, db, storage
+import schedule
 
 # --- БАПТАУЛАР / CONFIGURATION ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8908205939:AAFB-YufkUFK3WPxSlYMBTJtuNUoj_y8lGI")
@@ -75,7 +76,9 @@ def ensure_jarvis_config():
             "geo_fence_home_lat": 0.0,
             "geo_fence_home_lon": 0.0,
             "geo_fence_radius_meters": 300,
-            "self_prompt_enabled": False
+            "geo_fence_bt_mac": "00:11:22:33:44:55",
+            "self_prompt_enabled": False,
+            "self_prompt_suggestion": ""
         }
 
         if not isinstance(current_config, dict):
@@ -91,6 +94,76 @@ def ensure_jarvis_config():
                 print("[Firebase]: jarvis_config үшін жетіспейтін мәндер қосылды:", list(missing.keys()))
     except Exception as e:
         print("[Config Init Error]: jarvis_config орнатылмады:", e)
+
+# --- ӨЗІН-ӨЗІ ДАМЫТУ ЖҮЙЕСІ (SELF-PROMPTING) ---
+def run_self_prompting():
+    print("Жарвис логтарды талдауды бастады, Сэр...")
+    ref_logs = db.reference('logs')
+    logs_data = ref_logs.get()
+
+    if not logs_data:
+        print("Талдау үшін қателік логтары табылмады.")
+        return "Талдау үшін қателік логтары табылмады, Сэр."
+
+    # Логтарды мәтін түрінде жинақтау
+    formatted_logs = ""
+    if isinstance(logs_data, dict):
+        for key, val in logs_data.items():
+            if isinstance(val, dict):
+                formatted_logs += f"[{val.get('type')}]: {val.get('message')}\n"
+    elif isinstance(logs_data, list):
+        for val in logs_data:
+            if isinstance(val, dict):
+                formatted_logs += f"[{val.get('type')}]: {val.get('message')}\n"
+
+    # DeepSeek-R1 моделіне Hugging Face арқылы сұраныс жолдау
+    hf_token = os.environ.get('HF_TOKEN')
+    api_url = "https://api-inference.huggingface.co/models/deepseek-ai/DeepSeek-R1"
+    headers = {}
+    if hf_token:
+        headers["Authorization"] = f"Bearer {hf_token}"
+    
+    prompt = f"Сіз Көрінбейтін Жарвистің (Invisible Jarvis) ИИ жүйесісіз. Мына қателік логтарын талдап, ертеңгі күнге арналған жақсартылған жүйелік промпт (System Prompt) дайындаңыз:\n{formatted_logs}"
+    
+    payload = {"inputs": prompt, "parameters": {"max_new_tokens": 500}}
+    
+    try:
+        response = requests.post(api_url, headers=headers, json=payload, timeout=30)
+        result = response.json()
+        
+        # Жаңа промпт ұсынысын Firebase-ке жазу
+        suggestion = None
+        if isinstance(result, list) and len(result) > 0 and 'generated_text' in result[0]:
+            suggestion = result[0]['generated_text']
+        elif isinstance(result, dict) and 'generated_text' in result:
+            suggestion = result['generated_text']
+            
+        if suggestion:
+            db.reference('jarvis_config/self_prompt_suggestion').set({
+                'updated_at': int(time.time()),
+                'prompt_text': suggestion
+            })
+            print("Сэр, жаңа промпт сәтті дайындалды және Firebase-ке жүктелді.")
+            # Талданған ескі логтарды тазалау (дерекқор толып кетпеуі үшін)
+            ref_logs.delete()
+            return suggestion
+        else:
+            err_msg = f"API жауабы дұрыс емес пішімде: {result}"
+            print(err_msg)
+            return f"DeepSeek-R1 қатесі: {err_msg}"
+        
+    except Exception as e:
+        print(f"DeepSeek-пен байланыс орнату сәтсіз аяқталды: {e}")
+        return f"Сэр, байланыс орнату сәтсіз аяқталды: {e}"
+
+def start_scheduler():
+    schedule.every().day.at("00:00").do(run_self_prompting)
+    while True:
+        try:
+            schedule.run_pending()
+        except Exception as e:
+            print("[Scheduler Error]:", e)
+        time.sleep(60)
 
 # --- ДИПЛОМАТИЯЛЫҚ FALLBACK (DUCKDUCKGO AI - БҰҒАТТАЛМАҒАН АЛЬТЕРНАТИВА) ---
 def ask_duckduckgo(screen_text):
@@ -359,7 +432,7 @@ def parse_ai_response_sequence(response_text):
 
     actions = []
     action_pattern = re.compile(
-        r'ACTION:\s*(OPEN_APP|TYPE_TEXT|CLICK|SWIPE_DOWN|SWIPE_UP|GO_BACK|GO_HOME|SPEAK|TAKE_SELFIE|TAKE_SCREENSHOT|ALARM|STOP_ALARM|GET_DEVICE_STATUS|RECORD_AUDIO|GET_LOCATION|STOP|WAIT)\s*(?:\(\s*(.*?)\s*\))?',
+        r'ACTION:\s*(OPEN_APP|TYPE_TEXT|TYPE|CLICK|SWIPE_DOWN|SWIPE_UP|GO_BACK|GO_HOME|SPEAK|TAKE_SELFIE|TAKE_SCREENSHOT|ALARM|STOP_ALARM|GET_DEVICE_STATUS|RECORD_AUDIO|GET_LOCATION|STOP|WAIT)\s*(?:\(\s*(.*?)\s*\))?',
         re.IGNORECASE | re.DOTALL
     )
 
@@ -367,8 +440,17 @@ def parse_ai_response_sequence(response_text):
         action = match.group(1).upper()
         raw_value = match.group(2) or ""
 
+        # Normalize TYPE to TYPE_TEXT
+        if action == "TYPE":
+            action = "TYPE_TEXT"
+
+        # Strip surrounding quotes if present
+        val = raw_value.strip()
+        if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+            val = val[1:-1].strip()
+
         if action == "CLICK":
-            click_match = re.match(r'([0-9.]+)\s*,\s*([0-9.]+)', raw_value)
+            click_match = re.match(r'([0-9.]+)\s*,\s*([0-9.]+)', val)
             if click_match:
                 try:
                     x = float(click_match.group(1))
@@ -378,16 +460,16 @@ def parse_ai_response_sequence(response_text):
                     continue
         elif action == "RECORD_AUDIO":
             try:
-                actions.append(("RECORD_AUDIO", int(raw_value) if raw_value else 10))
+                actions.append(("RECORD_AUDIO", int(val) if val else 10))
             except ValueError:
                 actions.append(("RECORD_AUDIO", 10))
         elif action == "WAIT":
             try:
-                actions.append(("WAIT", float(raw_value) if raw_value else 1.0))
+                actions.append(("WAIT", float(val) if val else 1.0))
             except ValueError:
                 actions.append(("WAIT", 1.0))
         else:
-            actions.append((action, raw_value.strip()))
+            actions.append((action, val))
 
     return actions
 
@@ -514,11 +596,33 @@ def append_voice_history(command, screen_text, ai_response, action_type, action_
     except Exception as e:
         print("[Voice History Error]:", e)
 
-# --- FIREBASE ЭКРАН ТЫҢДАУШЫСЫ (SCREEN MONITOR) ---
+last_analyzed_screen_time = 0
+last_analyzed_screen_text = ""
+
 def on_screen_text_change(event):
-    if event.data:
-        screen_text = event.data
-        print(f"\n[Экран өзгерді]: {screen_text}")
+    global last_analyzed_screen_time, last_analyzed_screen_text
+    if not event.data: return
+    screen_text = str(event.data).strip()
+    if not screen_text: return
+
+    current_time = time.time()
+    # Cooldown of 5 seconds to prevent spamming Inference API limits
+    if current_time - last_analyzed_screen_time < 5.0:
+        return
+    # If the screen content didn't actually change
+    if screen_text == last_analyzed_screen_text:
+        return
+
+    last_analyzed_screen_time = current_time
+    last_analyzed_screen_text = screen_text
+    print(f"\n[Экран өзгерді, талдау басталуда]: {screen_text[:100]}...")
+    
+    # DeepSeek арқылы экранды талдау
+    ai_response = ask_deepseek(f"Screen Content:\n{screen_text}")
+    if ai_response:
+        actions = parse_ai_response_sequence(ai_response)
+        if actions:
+            threading.Thread(target=execute_action_sequence, args=(actions, "SCREEN_AUTO_ANALYSIS", screen_text, ai_response), daemon=True).start()
 
 try:
     db.reference("current_screen_text").listen(on_screen_text_change)
@@ -558,12 +662,28 @@ last_processed_voice_timestamp = int(time.time() * 1000)
 
 def on_voice_command_change(event):
     global last_processed_voice_timestamp
-    if not event.data or not isinstance(event.data, dict): return
+    if not event.data: return
     try:
-        command = event.data.get("command", "").strip()
-        timestamp = event.data.get("timestamp", 0)
+        # Support both string and dictionary formats for voice commands
+        if isinstance(event.data, str):
+            command = event.data.strip()
+            if command.lower() in ["", "none"]:
+                return
+            timestamp = int(time.time() * 1000)
+        elif isinstance(event.data, dict):
+            command = event.data.get("command", "").strip()
+            timestamp = event.data.get("timestamp", 0)
+        else:
+            return
+
         if not command or timestamp <= last_processed_voice_timestamp: return
         last_processed_voice_timestamp = timestamp
+        print(f"\n[Жаңа дауыстық бұйрық]: {command}")
+
+        # Clear voice commands to "none" if it was sent as a string to avoid loops
+        if isinstance(event.data, str):
+            db.reference("voice_commands").set("none")
+
         screen_text = db.reference("current_screen_text").get() or ""
         history_context = build_voice_history_context()
         ai_response = ask_deepseek_command(command, screen_text, history_context)
@@ -597,69 +717,66 @@ def show_screen(message):
 
 @bot.message_handler(commands=['stop'])
 def stop_jarvis(message):
-    db.reference("jarvis_status").set("STOP")
-    bot.reply_to(message, "🛑 Тоқтатылды.")
+    db.reference("commands/type").set("stop_service")
+    bot.reply_to(message, "🛑 Тоқтатылды, Сэр.")
 
 @bot.message_handler(commands=['selfie'])
 def take_selfie(message):
     try:
-        db.reference("jarvis_status").set("TAKE_SELFIE")
-        bot.reply_to(message, "📸 *Селфи жасау командасы жіберілді.* Сурет сәтті түсірілсе, осы чатқа келеді, бауырым.")
+        db.reference("commands/type").set("selfie")
+        bot.reply_to(message, "📸 *Селфи жасау командасы жіберілді.* Сурет сәтті түсірілсе, осы чатқа келеді, Сэр.")
     except Exception as e:
         print("[Telegram Error]:", e)
 
 @bot.message_handler(commands=['screenshot'])
 def take_screenshot(message):
     try:
-        db.reference("jarvis_status").set("TAKE_SCREENSHOT")
-        bot.reply_to(message, "📸 *Скриншот түсіру командасы жіберілді.* Дайын болғанда осы чатқа келеді, бауырым!")
+        db.reference("commands/type").set("screenshot")
+        bot.reply_to(message, "📸 *Скриншот түсіру командасы жіберілді.* Дайын болғанда осы чатқа келеді, Сэр!")
     except Exception as e:
         print("[Telegram Error]:", e)
 
 @bot.message_handler(commands=['alarm'])
 def start_alarm(message):
     try:
-        db.reference("jarvis_status").set("ALARM")
-        bot.reply_to(message, "🚨 *Ұрыға қарсы дабыл іске қосылды!* Телефон барынша шыңылдап сирена қосады.\nТоқтату үшін /stop_alarm деп жаз, немесе телефоннан Jarvis қолданбасын аш, бауырым!")
+        db.reference("commands/type").set("alarm")
+        bot.reply_to(message, "🚨 *Ұрыға қарсы дабыл іске қосылды!* Телефон барынша шыңылдап сирена қосады.\nТоқтату үшін /stop_alarm деп жаз, немесе телефоннан Jarvis қолданбасын аш, Сэр!")
     except Exception as e:
         print("[Telegram Error]:", e)
 
 @bot.message_handler(commands=['stop_alarm'])
 def stop_alarm(message):
     try:
-        db.reference("jarvis_status").set("START")
-        bot.reply_to(message, "✅ *Дабыл тоқтатылды!* Телефон тынышталды, бауырым.")
+        db.reference("commands/type").set("stop_alarm")
+        bot.reply_to(message, "✅ *Дабыл тоқтатылды!* Телефон тынышталды, Сэр.")
     except Exception as e:
         print("[Telegram Error]:", e)
 
 @bot.message_handler(commands=['device'])
 def get_device_status(message):
     try:
-        db.reference("device_info").delete()
-        db.reference("jarvis_status").set("GET_DEVICE_STATUS")
-        bot.reply_to(message, "⏳ *Құрылғы мәліметтері жиналуда...* Сәл күте тұр, бауырым.")
-        
-        for _ in range(12):
-            time.sleep(0.5)
-            info = db.reference("device_info").get()
-            if info and isinstance(info, dict) and "timestamp" in info:
-                battery = info.get("battery", "Белгісіз")
-                thermal = info.get("thermal", "Белгісіз")
-                wifi = info.get("wifi", "Белгісіз")
-                ram = info.get("ram", "Белгісіз")
-                
-                msg = (
-                    "📱 *Құрылғы статусы (Device Status):*\n\n"
-                    f"🔋 *Батарея:* `{battery}`\n"
-                    f"🌡 *Температура:* `{thermal}`\n"
-                    f"📶 *Желі (Wi-Fi):* `{wifi}`\n"
-                    f"🧠 *Жад (RAM):* `{ram}`\n"
-                    "Бауырым, телефонның жағдайы осындай!"
-                )
-                bot.send_message(message.chat.id, msg, parse_mode="Markdown")
-                return
-                
-        bot.reply_to(message, "⚠️ *Қате:* Телефоннан жауап келмеді. Бауырым, телефон қосулы және интернетте екенін тексерші.")
+        status_data = db.reference("jarvis_status").get()
+        if status_data and isinstance(status_data, dict):
+            state = status_data.get("state", "Белгісіз")
+            battery = status_data.get("battery_level", "Белгісіз")
+            thermal = status_data.get("battery_temp", "Белгісіз")
+            heavy = "Сөндірулі" if status_data.get("heavy_mode") is False else "Қосулы"
+            ram = status_data.get("ram_free", "Белгісіз")
+            wifi = status_data.get("wifi_ssid", "Белгісіз")
+            
+            msg = (
+                "📱 *Құрылғы статусы (Device Status):*\n\n"
+                f"⚙️ *Күйі (State):* `{state}`\n"
+                f"🔋 *Батарея:* `{battery}%`\n"
+                f"🌡 *Температура:* `{thermal}°C`\n"
+                f"⚡ *Ауыр режим (Heavy Mode):* `{heavy}`\n"
+                f"🧠 *Жедел жад (RAM Free):* `{ram}`\n"
+                f"📶 *Желі (Wi-Fi/Network):* `{wifi}`\n\n"
+                "Сэр, телефонның жағдайы осындай!"
+            )
+            bot.send_message(message.chat.id, msg, parse_mode="Markdown")
+        else:
+            bot.reply_to(message, "⚠️ *Қате:* Құрылғы статусы табылмады. Телефонның іске қосылғанын тексеріңіз, Сэр.")
     except Exception as e:
         print("[Telegram Error]:", e)
         bot.reply_to(message, f"❌ Қате орын алды: {e}")
@@ -677,8 +794,8 @@ def record_audio(message):
             except ValueError:
                 pass
         db.reference("commands/record_duration").set(duration)
-        db.reference("jarvis_status").set("RECORD_AUDIO")
-        bot.reply_to(message, f"🎙 *Дауыс жазу басталды ({duration} сек).* Айналадағы дыбыс жазылып, осы чатқа жіберіледі, бауырым.")
+        db.reference("commands/type").set("record")
+        bot.reply_to(message, f"🎙 *Дауыс жазу басталды ({duration} сек).* Айналадағы дыбыс жазылып, осы чатқа жіберіледі, Сэр.")
     except Exception as e:
         print("[Telegram Error]:", e)
 
@@ -686,8 +803,8 @@ def record_audio(message):
 def get_location(message):
     try:
         db.reference("device_location").delete()
-        db.reference("jarvis_status").set("GET_LOCATION")
-        bot.reply_to(message, "⏳ *Телефон координаттары анықталуда...* Сәл күте тұр, бауырым.")
+        db.reference("commands/type").set("location")
+        bot.reply_to(message, "⏳ *Телефон координаттары анықталуда...* Сәл күте тұр, Сэр.")
         
         for _ in range(12):
             time.sleep(0.5)
@@ -707,12 +824,12 @@ def get_location(message):
                     f"🌐 *Бойлық (Longitude):* `{lon}`\n"
                     f"🎯 *Дәлдік:* `~{acc} метр`\n\n"
                     f"🗺 [Google Maps сілтемесі]({maps_url})\n\n"
-                    "Бауырым, телефон дәл осы жерде тұр!"
+                    "Сэр, телефон дәл осы жерде тұр!"
                 )
                 bot.send_message(message.chat.id, msg, parse_mode="Markdown")
                 return
                 
-        bot.reply_to(message, "⚠️ *Қате:* Телефоннан жауап келмеді. Бауырым, телефон қосулы және интернетте екенін тексерші.")
+        bot.reply_to(message, "⚠️ *Қате:* Телефоннан жауап келмеді. Телефон қосулы және интернетте екенін тексеріңіз, Сэр.")
     except Exception as e:
         print("[Telegram Error]:", e)
         bot.reply_to(message, f"❌ Қате орын алды: {e}")
@@ -806,6 +923,7 @@ def list_commands(message):
         "⚙️ *Жүйе статусы:*\n"
         "👉 /device — Батарея, температура, RAM және Wi-Fi мәліметтерін алу\n"
         "👉 /status — Жарвистің қазіргі жүйелік статусын тексеру\n"
+        "👉 /self_prompt — Қателерді талдап, жаңа промпт дайындау\n"
         "👉 /stop — Жарвисті қашықтан толық сөндіру (Kill-Switch)\n\n"
         "Бауырым, керекті команданы таңда немесе сұрағыңды жай мәтінмен жаз!"
     )
@@ -816,11 +934,33 @@ def list_commands(message):
 
 @bot.message_handler(commands=['status'])
 def check_status(message):
-    status = db.reference("jarvis_status").get()
+    status_data = db.reference("jarvis_status").get()
+    if isinstance(status_data, dict):
+        state = status_data.get("state", "ACTIVE")
+        battery = status_data.get("battery_level", "Белгісіз")
+        temp = status_data.get("battery_temp", "Белгісіз")
+        heavy = "Сөндірулі" if status_data.get("heavy_mode") is False else "Қосулы"
+        status = f"{state} (Заряд: {battery}%, Темп: {temp}°C, Ауыр режим: {heavy})"
+    else:
+        status = status_data if status_data else "Offline"
     try:
         bot.reply_to(message, f"ℹ️ *Ағымдағы статус:* `{status}`")
     except Exception as e:
         print("[Telegram Error]:", e)
+
+@bot.message_handler(commands=['self_prompt'])
+def self_prompt_command(message):
+    bot.reply_to(message, "⏳ *Жарвис логтарды талдауды бастады, Сэр...*")
+    suggestion = run_self_prompting()
+    if suggestion:
+        if len(suggestion) > 4000:
+            suggestion = suggestion[:3900] + "\n\n... [Мәтін тым ұзын болғандықтан қысқартылды]"
+        try:
+            bot.send_message(message.chat.id, f"📝 *Жаңа жүйелік промпт ұсынысы (DeepSeek-R1):*\n\n{suggestion}", parse_mode="Markdown")
+        except Exception:
+            bot.send_message(message.chat.id, f"📝 Жаңа жүйелік промпт ұсынысы (DeepSeek-R1):\n\n{suggestion}")
+    else:
+        bot.reply_to(message, "❌ Қателік логтары табылмады немесе талдау сәтсіз аяқталды.")
 
 @bot.message_handler(func=lambda message: True)
 def echo_all(message):
@@ -903,6 +1043,10 @@ def run_telegram_bot():
 if __name__ == "__main__":
     ensure_jarvis_config()
 
+    # Өзін-өзі дамыту жоспарлаушысын іске қосу (Scheduler)
+    scheduler_thread = threading.Thread(target=start_scheduler, daemon=True)
+    scheduler_thread.start()
+
     # Телеграм ботты фонда қосу
     bot_thread = threading.Thread(target=run_telegram_bot, daemon=True)
     bot_thread.start()
@@ -912,7 +1056,14 @@ if __name__ == "__main__":
     
     def check_status():
         try:
-            status = db.reference("jarvis_status").get()
+            status_data = db.reference("jarvis_status").get()
+            if isinstance(status_data, dict):
+                state = status_data.get("state", "ACTIVE")
+                battery = status_data.get("battery_level", "Белгісіз")
+                heavy = "Сөндірулі" if status_data.get("heavy_mode") is False else "Қосулы"
+                status = f"{state} (Заряд: {battery}%, Ауыр режим: {heavy})"
+            else:
+                status = status_data if status_data else "Offline"
             return f"Жүйе қосулы. Ағымдағы статус: {status}"
         except Exception as e:
             return f"Қате: {e}"
