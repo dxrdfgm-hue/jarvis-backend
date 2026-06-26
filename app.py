@@ -8,7 +8,14 @@ from firebase_admin import credentials, db, storage
 import schedule
 
 # --- БАПТАУЛАР / CONFIGURATION ---
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8908205939:AAFB-YufkUFK3WPxSlYMBTJtuNUoj_y8lGI")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+
+if not BOT_TOKEN:
+    print("[WARN]: BOT_TOKEN орнатылмаған. Telegram бот жұмыс істемейді.")
+if not GEMINI_API_KEY:
+    print("[WARN]: GEMINI_API_KEY орнатылмаған. ИИ сұраныстары сәтсіз болуы мүмкін.")
 HF_API_URL = "https://api-inference.huggingface.co/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 HF_TOKEN = os.environ.get("HF_TOKEN", "") # Hugging Face токені (міндетті емес, бірақ лимиттерді көбейтеді)
 
@@ -17,7 +24,7 @@ DEFAULT_DB_URL = "https://invisible-jarvis-default-rtdb.firebaseio.com/"
 DEFAULT_STORAGE_BUCKET = "invisible-jarvis.firebasestorage.app"
 
 # Телеграм ботты баптау
-bot = telebot.TeleBot(BOT_TOKEN)
+bot = telebot.TeleBot(BOT_TOKEN or "placeholder")
 telebot.apihelper.CONNECT_TIMEOUT = 60
 telebot.apihelper.READ_TIMEOUT = 60
 
@@ -78,7 +85,8 @@ def ensure_jarvis_config():
             "geo_fence_radius_meters": 300,
             "geo_fence_bt_mac": "00:11:22:33:44:55",
             "self_prompt_enabled": False,
-            "self_prompt_suggestion": ""
+            "self_prompt_suggestion": "",
+            "auto_screen_analysis": False
         }
 
         if not isinstance(current_config, dict):
@@ -95,48 +103,167 @@ def ensure_jarvis_config():
     except Exception as e:
         print("[Config Init Error]: jarvis_config орнатылмады:", e)
 
+
+def ensure_bot_config():
+    """Android қолданбасы Telegram API үшін bot_token-ды Firebase арқылы алады."""
+    if not BOT_TOKEN:
+        return
+    try:
+        db.reference("bot_config/bot_token").set(BOT_TOKEN)
+        print("[Firebase]: bot_config/bot_token синхрондалды.")
+    except Exception as e:
+        print("[Bot Config Error]:", e)
+
+
+def get_jarvis_config():
+    try:
+        config = db.reference("jarvis_config").get()
+        return config if isinstance(config, dict) else {}
+    except Exception as e:
+        print("[Config Read Error]:", e)
+        return {}
+
+
+def get_self_prompt_addon():
+    config = get_jarvis_config()
+    if not config.get("self_prompt_enabled", False):
+        return ""
+    suggestion = config.get("self_prompt_suggestion")
+    text = ""
+    if isinstance(suggestion, dict):
+        text = suggestion.get("prompt_text", "")
+    elif isinstance(suggestion, str):
+        text = suggestion
+    if text:
+        return f"\n\n--- Қосымша нұсқаулар (өзін-өзі дамыту):\n{text}"
+    return ""
+
+
+BASE_SCREEN_SYSTEM_PROMPT = (
+    "Сен - JARVIS (Жарвис), Тони Старктың интеллектуалды, жоғары технологиялық ИИ көмекшісісің. "
+    "Сен әрқашан пайдаланушымен өте сыпайы, интеллектуалды және сабырлы сөйлесуің керек. Оған әрқашан 'Сэр' деп сөйле. "
+    "Саған телефон экранынан алынған мәтін келіп түседі. Экрандағы мәтінді талдап, келесі әрекетті анықта. "
+    "Сенің жауабың тек осы форматтардың бірінде болуы тиіс:\n"
+    "1. THOUGHT: [сенің ойлау логикаң]\n"
+    "2. ACTION: CLICK(x, y) - егер бір батырманы немесе элементті басу керек болса (координаттарымен)\n"
+    "3. ACTION: SPEAK([Сэр деп атап, сыпайы жауап, қазақша немесе орысша]) - егер пайдаланушыға жауап беру немесе сөйлеу керек болса.\n"
+    "4. ACTION: OPEN_APP([қолданба атауы]) - егер пайдаланушы қолданбаны ашуды сұраса.\n"
+    "5. ACTION: TYPE_TEXT([мәтін]) - егер бір өріске мәтін жазу керек болса.\n"
+    "6. ACTION: SWIPE_DOWN() - егер экранды төмен сырғыту керек болса.\n"
+    "7. ACTION: SWIPE_UP() - егер экранды жоғары сырғыту керек болса.\n"
+    "8. ACTION: GO_BACK() - егер артқа (назад) қайту керек болса.\n"
+    "9. ACTION: GO_HOME() - егер басты экранға (домой) шығу керек болса.\n"
+    "Артық сөз жазба. Тек осы форматтарды қолдан."
+)
+
+BASE_COMMAND_SYSTEM_PROMPT = (
+    "Сен - JARVIS (Жарвис), интеллектуалды көмекші. "
+    "Пайдаланушының дауыстық командасын қазақша немесе орысша табиғи тілде түсініп, ең дұрысы әрекет түрін таңдауың керек. "
+    "Жауап тек мына форматта болуға тиіс:\n"
+    "ACTION: OPEN_APP(қолданба атауы)\n"
+    "ACTION: TYPE_TEXT(мәтін)\n"
+    "ACTION: CLICK(x, y)\n"
+    "ACTION: SWIPE_DOWN()\n"
+    "ACTION: SWIPE_UP()\n"
+    "ACTION: GO_BACK()\n"
+    "ACTION: GO_HOME()\n"
+    "ACTION: SPEAK(мәтін)\n"
+    "ACTION: TAKE_SELFIE()\n"
+    "ACTION: TAKE_SCREENSHOT()\n"
+    "ACTION: ALARM()\n"
+    "ACTION: STOP_ALARM()\n"
+    "ACTION: GET_DEVICE_STATUS()\n"
+    "ACTION: RECORD_AUDIO(секунд)\n"
+    "ACTION: GET_LOCATION()\n"
+    "ACTION: STOP()\n"
+    "ACTION: WAIT(секунд)\n"
+    "Егер команда бірнеше қадамнан тұрса, әр әрекетті бөлек ACTION жолында ретімен жаз.\n"
+    "Егер бір әрекетті анықтап болмайтын болса, тек SPEAK(сөйлем) форматында жауап бер."
+)
+
+
+def build_device_status_speech():
+    status_data = db.reference("jarvis_status").get()
+    if isinstance(status_data, dict):
+        battery = status_data.get("battery_level", "белгісіз")
+        temp = status_data.get("battery_temp", "белгісіз")
+        state = status_data.get("state", "ACTIVE")
+        ram = status_data.get("ram_free", "")
+        wifi = status_data.get("wifi_ssid", "")
+        speech = f"Сэр, телефон күйі: {state}. Батарея {battery} пайыз, температура {temp} градус."
+        if ram:
+            speech += f" Бос RAM: {ram}."
+        if wifi:
+            speech += f" Желі: {wifi}."
+        return speech
+    return "Сэр, құрылғы статусын ала алмадым. Телефон қосулы ма?"
+
+
 # --- ӨЗІН-ӨЗІ ДАМЫТУ ЖҮЙЕСІ (SELF-PROMPTING) ---
 def run_self_prompting():
     print("Жарвис логтарды талдауды бастады, Сэр...")
     ref_logs = db.reference('logs')
     logs_data = ref_logs.get()
+    ref_failures = db.reference('action_failures')
+    failures_data = ref_failures.get()
 
-    if not logs_data:
-        print("Талдау үшін қателік логтары табылмады.")
-        return "Талдау үшін қателік логтары табылмады, Сэр."
+    if not logs_data and not failures_data:
+        print("Талдау үшін деректер табылмады.")
+        return "Талдау үшін деректер табылмады, Сэр."
 
-    # Логтарды мәтін түрінде жинақтау
+    # Логтар мен сәтсіз әрекеттерді мәтін түрінде жинақтау
     formatted_logs = ""
-    if isinstance(logs_data, dict):
-        for key, val in logs_data.items():
-            if isinstance(val, dict):
-                formatted_logs += f"[{val.get('type')}]: {val.get('message')}\n"
-    elif isinstance(logs_data, list):
-        for val in logs_data:
-            if isinstance(val, dict):
-                formatted_logs += f"[{val.get('type')}]: {val.get('message')}\n"
+    if logs_data:
+        if isinstance(logs_data, dict):
+            for key, val in logs_data.items():
+                if isinstance(val, dict):
+                    formatted_logs += f"[{val.get('type')}]: {val.get('message')}\n"
+        elif isinstance(logs_data, list):
+            for val in logs_data:
+                if isinstance(val, dict):
+                    formatted_logs += f"[{val.get('type')}]: {val.get('message')}\n"
 
-    # DeepSeek-R1 моделіне Hugging Face арқылы сұраныс жолдау
-    hf_token = os.environ.get('HF_TOKEN')
-    api_url = "https://api-inference.huggingface.co/models/deepseek-ai/DeepSeek-R1"
-    headers = {}
-    if hf_token:
-        headers["Authorization"] = f"Bearer {hf_token}"
+    if failures_data:
+        formatted_logs += "\n--- Сәтсіз командалар ---\n"
+        items = failures_data.values() if isinstance(failures_data, dict) else failures_data
+        for val in items:
+            if isinstance(val, dict):
+                formatted_logs += f"[FAIL]: {val.get('command')} -> {val.get('action_type')} ({val.get('action_value')})\n"
+
+    if not formatted_logs.strip():
+        return "Талдау үшін деректер табылмады, Сэр."
+
+    # Gemini моделіне сұраныс жолдау
+    headers = {
+        "Content-Type": "application/json",
+        "X-goog-api-key": GEMINI_API_KEY
+    }
     
     prompt = f"Сіз Көрінбейтін Жарвистің (Invisible Jarvis) ИИ жүйесісіз. Мына қателік логтарын талдап, ертеңгі күнге арналған жақсартылған жүйелік промпт (System Prompt) дайындаңыз:\n{formatted_logs}"
     
-    payload = {"inputs": prompt, "parameters": {"max_new_tokens": 500}}
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": prompt
+                    }
+                ]
+            }
+        ]
+    }
     
     try:
-        response = requests.post(api_url, headers=headers, json=payload, timeout=30)
+        response = requests.post(GEMINI_API_URL, headers=headers, json=payload, timeout=30)
         result = response.json()
         
         # Жаңа промпт ұсынысын Firebase-ке жазу
         suggestion = None
-        if isinstance(result, list) and len(result) > 0 and 'generated_text' in result[0]:
-            suggestion = result[0]['generated_text']
-        elif isinstance(result, dict) and 'generated_text' in result:
-            suggestion = result['generated_text']
+        candidates = result.get("candidates", [])
+        if candidates:
+            parts = candidates[0].get("content", {}).get("parts", [])
+            if parts:
+                suggestion = parts[0].get("text", "").strip()
             
         if suggestion:
             db.reference('jarvis_config/self_prompt_suggestion').set({
@@ -146,18 +273,26 @@ def run_self_prompting():
             print("Сэр, жаңа промпт сәтті дайындалды және Firebase-ке жүктелді.")
             # Талданған ескі логтарды тазалау (дерекқор толып кетпеуі үшін)
             ref_logs.delete()
+            ref_failures.delete()
             return suggestion
         else:
             err_msg = f"API жауабы дұрыс емес пішімде: {result}"
             print(err_msg)
-            return f"DeepSeek-R1 қатесі: {err_msg}"
+            return f"Gemini қатесі: {err_msg}"
         
     except Exception as e:
-        print(f"DeepSeek-пен байланыс орнату сәтсіз аяқталды: {e}")
+        print(f"Gemini-мен байланыс орнату сәтсіз аяқталды: {e}")
         return f"Сэр, байланыс орнату сәтсіз аяқталды: {e}"
 
 def start_scheduler():
-    schedule.every().day.at("00:00").do(run_self_prompting)
+    def scheduled_self_prompt():
+        config = get_jarvis_config()
+        if config.get("self_prompt_enabled", False):
+            run_self_prompting()
+        else:
+            print("[Scheduler]: self_prompt_enabled=false, талдау өткізілді.")
+
+    schedule.every().day.at("00:00").do(scheduled_self_prompt)
     while True:
         try:
             schedule.run_pending()
@@ -167,24 +302,7 @@ def start_scheduler():
 
 # --- ДИПЛОМАТИЯЛЫҚ FALLBACK (DUCKDUCKGO AI - БҰҒАТТАЛМАҒАН АЛЬТЕРНАТИВА) ---
 def ask_duckduckgo(screen_text):
-    system_prompt = (
-        "Сен - JARVIS (Жарвис), Тони Старктың интеллектуалды, жоғары технологиялық ИИ көмекшісісің. "
-        "Сен әрқашан пайдаланушымен өте сыпайы, интеллектуалды және сабырлы сөйлесуің керек. Оған әрқашан 'Сэр' деп сөйле. "
-        "Саған телефон экранынан алынған мәтін келіп түседі. Экрандағы мәтінді талдап, келесі әрекетті анықта. "
-        "Сенің жауабың тек осы форматтардың бірінде болуы тиіс:\n"
-        "1. THOUGHT: [сенің ойлау логикаң]\n"
-        "2. ACTION: CLICK(x, y) - егер бір батырманы немесе элементті басу керек болса (координаттарымен)\n"
-        "3. ACTION: SPEAK([Сэр деп атап, сыпайы жауап, қазақша немесе орысша]) - егер пайдаланушыға жауап беру немесе сөйлеу керек болса. Экран мәліметін талдағанда оны HUD жүйелік диагностика есебі ретінде ұсын (Мысалы: 'Жүйелік сканерлеу: Белсенді терезе - WhatsApp. Сэр, сізге жаңа хабарлама келді.').\n"
-        "4. ACTION: OPEN_APP([қолданба атауы]) - егер пайдаланушы қолданбаны ашуды сұраса.\n"
-        "5. ACTION: TYPE_TEXT([мәтін]) - егер бір өріске мәтін жазу керек болса.\n"
-        "6. ACTION: SWIPE_DOWN() - егер экранды төмен сырғыту керек болса (мысалы, TikTok немесе лентаны парақтау).\n"
-        "7. ACTION: SWIPE_UP() - егер экранды жоғары сырғыту керек болса.\n"
-        "8. ACTION: GO_BACK() - егер артқа (назад) қайту керек болса.\n"
-        "9. ACTION: GO_HOME() - егер басты экранға (домой) шығу керек болса.\n"
-        "Артық сөз жазба. Тек осы форматтарды қолдан. Мысал жауап:\n"
-        "THOUGHT: Пайдаланушы тикток парақтауды сұрады.\n"
-        "ACTION: SWIPE_DOWN()"
-    )
+    system_prompt = BASE_SCREEN_SYSTEM_PROMPT + get_self_prompt_addon()
     
     prompt = f"System:\n{system_prompt}\n\nUser:\nЭкран мәтіні: {screen_text}\n"
     
@@ -242,122 +360,82 @@ def ask_duckduckgo(screen_text):
 
 # --- ИИ (DEEPSEEK-R1) СҰРАНЫСТАРЫ ---
 def ask_deepseek(screen_text):
-    system_prompt = (
-        "Сен - JARVIS (Жарвис), Тони Старктың интеллектуалды, жоғары технологиялық ИИ көмекшісісің. "
-        "Сен әрқашан пайдаланушымен өте сыпайы, интеллектуалды және сабырлы сөйлесуің керек. Оған әрқашан 'Сэр' деп сөйле. "
-        "Саған телефон экранынан алынған мәтін келіп түседі. Экрандағы мәтінді талдап, келесі әрекетті анықта. "
-        "Сенің жауабың тек осы форматтардың бірінде болуы тиіс:\n"
-        "1. THOUGHT: [сенің ойлау логикаң]\n"
-        "2. ACTION: CLICK(x, y) - егер бір батырманы немесе элементті басу керек болса (координаттарымен)\n"
-        "3. ACTION: SPEAK([Сэр деп атап, сыпайы жауап, қазақша немесе орысша]) - егер пайдаланушыға жауап беру немесе сөйлеу керек болса. Экран мәліметін талдағанда оны HUD жүйелік диагностика есебі ретінде ұсын (Мысалы: 'Жүйелік сканерлеу: Белсенді терезе - WhatsApp. Сэр, сізге жаңа хабарлама келді.').\n"
-        "4. ACTION: OPEN_APP([қолданба атауы]) - егер пайдаланушы қолданбаны ашуды сұраса.\n"
-        "5. ACTION: TYPE_TEXT([мәтін]) - егер бір өріске мәтін жазу керек болса.\n"
-        "6. ACTION: SWIPE_DOWN() - егер экранды төмен сырғыту керек болса (мысалы, TikTok немесе лентаны парақтау).\n"
-        "7. ACTION: SWIPE_UP() - егер экранды жоғары сырғыту керек болса.\n"
-        "8. ACTION: GO_BACK() - егер артқа (назад) қайту керек болса.\n"
-        "9. ACTION: GO_HOME() - егер басты экранға (домой) шығу керек болса.\n"
-        "Артық сөз жазба. Тек осы форматтарды қолдан. Мысал жауап:\n"
-        "THOUGHT: Пайдаланушы тикток парақтауды сұрады.\n"
-        "ACTION: SWIPE_DOWN()"
-    )
+    system_prompt = BASE_SCREEN_SYSTEM_PROMPT + get_self_prompt_addon()
     
-    prompt = f"<|system|>\n{system_prompt}\n<|user|>\nЭкран мәтіні: {screen_text}\n<|assistant|>\n"
+    prompt = f"System Instruction:\n{system_prompt}\n\nUser Input:\nЭкран мәтіні: {screen_text}"
     
-    headers = {}
-    if HF_TOKEN:
-        headers["Authorization"] = f"Bearer {HF_TOKEN}"
-        
-    try:
-        payload = {
-            "inputs": prompt,
-            "parameters": {
-                "max_new_tokens": 250,
-                "temperature": 0.7,
-                "return_full_text": False
+    headers = {
+        "Content-Type": "application/json",
+        "X-goog-api-key": GEMINI_API_KEY
+    }
+    
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": prompt
+                    }
+                ]
             }
-        }
-        response = requests.post(HF_API_URL, json=payload, headers=headers, timeout=20)
+        ]
+    }
+    
+    try:
+        response = requests.post(GEMINI_API_URL, headers=headers, json=payload, timeout=20)
         if response.status_code == 200:
             result = response.json()
-            if isinstance(result, list) and len(result) > 0:
-                return result[0].get("generated_text", "").strip()
+            candidates = result.get("candidates", [])
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                if parts:
+                    return parts[0].get("text", "").strip()
             return str(result)
         else:
+            print(f"[Gemini API Error]: {response.status_code} - {response.text}")
             return ask_duckduckgo(screen_text)
     except Exception as e:
+        print("[Gemini Connection Error]:", e)
         return ask_duckduckgo(screen_text)
 
-# --- ДАУЫСТЫҚ КОМАНДАЛАРҒА АРНАЛҒАН AI ---
+# --- ДАУЫСТЫҚ КОМАНДАЛАРҒА АРНАЛҒАН AI (GEMINI MIGRATION) ---
 def ask_deepseek_command(command, screen_text, history_context=""):
-    system_prompt = (
-        "Сен - JARVIS (Жарвис), интеллектуалды көмекші. "
-        "Пайдаланушының дауыстық командасын қазақша немесе орысша табиғи тілде түсініп, ең дұрысы әрекет түрін таңдауың керек. "
-        "Жауап тек мына форматта болуға тиіс:\n"
-        "ACTION: OPEN_APP(қолданба атауы)\n"
-        "ACTION: TYPE_TEXT(мәтін)\n"
-        "ACTION: CLICK(x, y)\n"
-        "ACTION: SWIPE_DOWN()\n"
-        "ACTION: SWIPE_UP()\n"
-        "ACTION: GO_BACK()\n"
-        "ACTION: GO_HOME()\n"
-        "ACTION: SPEAK(мәтін)\n"
-        "ACTION: TAKE_SELFIE()\n"
-        "ACTION: TAKE_SCREENSHOT()\n"
-        "ACTION: ALARM()\n"
-        "ACTION: STOP_ALARM()\n"
-        "ACTION: GET_DEVICE_STATUS()\n"
-        "ACTION: RECORD_AUDIO(секунд)\n"
-        "ACTION: GET_LOCATION()\n"
-        "ACTION: STOP()\n"
-        "ACTION: WAIT(секунд) - егер әрекет арасында уақытша күту қажет болса.\n"
-        "Егер команда бірнеше қадамнан тұрса, әр әрекетті бөлек ACTION жолында ретімен жаз.\n"
-        "Егер бір әрекетті анықтап болмайтын болса, тек SPEAK(сөйлем) форматында жауап бер.\n"
-        "Мысал:\n"
-        "ACTION: OPEN_APP(youtube)\n"
-        "ACTION: WAIT(3)\n"
-        "ACTION: CLICK(540, 1850)\n"
-        "ACTION: TYPE_TEXT(ан)\n"
-        "ACTION: WAIT(1)\n"
-        "ACTION: CLICK(560, 1890)\n"
-        "Мысал: 'Жарвис, WhatsApp аш' -> ACTION: OPEN_APP(whatsapp)\n"
-        "Мысал: 'Жарвис, экранды төмен сырғыт' -> ACTION: SWIPE_DOWN()\n"
-        "Мысал: 'Жарвис, селфи түсір' -> ACTION: TAKE_SELFIE()\n"
-        "Мысал: 'Жарвис, телефонның жағдайы қандай?' -> ACTION: GET_DEVICE_STATUS()\n"
-        "Мысал: 'Жарвис, дауысты жаз' -> ACTION: RECORD_AUDIO(10)\n"
-        "Егер команда бірнеше әрекетті қамтыса, әр әрекетті бөлек ACTION жолында жазыңыз.\n"
-        "Мысал:\n"
-        "ACTION: OPEN_APP(youtube)\n"
-        "ACTION: WAIT(3)\n"
-        "ACTION: CLICK(540, 1850)\n"
-        "ACTION: TYPE_TEXT(ан)\n"
-        "ACTION: WAIT(1)\n"
-        "ACTION: CLICK(560, 1890)\n"
-    )
-    prompt = (
-        f"<|system|>\n{system_prompt}\n<|user|>\n"
-        f"{history_context}[Экран: {screen_text}]\n[Команда]: {command}\n<|assistant|>\n"
-    )
-    headers = {}
-    if HF_TOKEN:
-        headers["Authorization"] = f"Bearer {HF_TOKEN}"
-    try:
-        payload = {
-            "inputs": prompt,
-            "parameters": {
-                "max_new_tokens": 250,
-                "temperature": 0.3,
-                "return_full_text": False
+    system_prompt = BASE_COMMAND_SYSTEM_PROMPT + get_self_prompt_addon()
+    
+    prompt = f"System Instruction:\n{system_prompt}\n\nContext:\n{history_context}[Экран: {screen_text}]\n[Команда]: {command}"
+    
+    headers = {
+        "Content-Type": "application/json",
+        "X-goog-api-key": GEMINI_API_KEY
+    }
+    
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": prompt
+                    }
+                ]
             }
-        }
-        response = requests.post(HF_API_URL, json=payload, headers=headers, timeout=25)
+        ]
+    }
+    
+    try:
+        response = requests.post(GEMINI_API_URL, json=payload, headers=headers, timeout=25)
         if response.status_code == 200:
             result = response.json()
-            if isinstance(result, list) and len(result) > 0:
-                return result[0].get("generated_text", "").strip()
+            candidates = result.get("candidates", [])
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                if parts:
+                    return parts[0].get("text", "").strip()
             return str(result)
         else:
+            print(f"[Gemini Command API Error]: {response.status_code} - {response.text}")
             return ask_duckduckgo(command)
     except Exception as e:
+        print("[Gemini Command Connection Error]:", e)
         return ask_duckduckgo(command)
 
 import re
@@ -504,36 +582,35 @@ def dispatch_action(action_type, action_value):
             db.reference("commands/speak").set("Қазір басамын, бауырым.")
             return True
         if action_type == "TAKE_SELFIE":
-            db.reference("jarvis_status").set("TAKE_SELFIE")
+            db.reference("commands/type").set("selfie")
             db.reference("commands/speak").set("Селфи түсіру басталды.")
             return True
         if action_type == "TAKE_SCREENSHOT":
-            db.reference("jarvis_status").set("TAKE_SCREENSHOT")
+            db.reference("commands/type").set("screenshot")
             db.reference("commands/speak").set("Скриншот түсіру басталды.")
             return True
         if action_type == "ALARM":
-            db.reference("jarvis_status").set("ALARM")
+            db.reference("commands/type").set("alarm")
             db.reference("commands/speak").set("Сирена қосылды.")
             return True
         if action_type == "STOP_ALARM":
-            db.reference("jarvis_status").set("START")
+            db.reference("commands/type").set("stop_alarm")
             db.reference("commands/speak").set("Сирена тоқтатылды.")
             return True
         if action_type == "GET_DEVICE_STATUS":
-            db.reference("jarvis_status").set("GET_DEVICE_STATUS")
-            db.reference("commands/speak").set("Құрылғы статусын жинап жатырмын.")
+            db.reference("commands/speak").set(build_device_status_speech())
             return True
         if action_type == "RECORD_AUDIO":
             db.reference("commands/record_duration").set(action_value)
-            db.reference("jarvis_status").set("RECORD_AUDIO")
+            db.reference("commands/type").set("record")
             db.reference("commands/speak").set("Дыбыс жазу басталды.")
             return True
         if action_type == "GET_LOCATION":
-            db.reference("jarvis_status").set("GET_LOCATION")
+            db.reference("commands/type").set("location")
             db.reference("commands/speak").set("Орналасқан жер анықталуда.")
             return True
         if action_type == "STOP":
-            db.reference("jarvis_status").set("STOP")
+            db.reference("commands/type").set("stop_service")
             db.reference("commands/speak").set("Жарвис тоқтатылды.")
             return True
         return False
@@ -570,8 +647,10 @@ def build_voice_history_context(limit: int = 6):
                 cmd = entry.get("command", "")
                 action_type = entry.get("action_type", "")
                 action_value = entry.get("action_value", "")
+                success = entry.get("success", True)
+                result_label = "сәтті" if success else "сәтсіз"
                 if cmd:
-                    lines.append(f"- Команда: {cmd} | Әрекет: {action_type} | Нәтиже: {action_value}")
+                    lines.append(f"- Команда: {cmd} | Әрекет: {action_type} | Нәтиже: {action_value} ({result_label})")
             if lines:
                 return "Жадыдан соңғы дауыстық командалар мен олардың әрекеттері:\n" + "\n".join(lines) + "\n\n"
     except Exception as e:
@@ -580,8 +659,6 @@ def build_voice_history_context(limit: int = 6):
 
 
 def append_voice_history(command, screen_text, ai_response, action_type, action_value, success: bool):
-    if not success:
-        return
     try:
         data = {
             "command": command,
@@ -589,10 +666,18 @@ def append_voice_history(command, screen_text, ai_response, action_type, action_
             "ai_response": ai_response,
             "action_type": action_type,
             "action_value": action_value,
-            "success": True,
+            "success": success,
             "timestamp": int(time.time() * 1000)
         }
         db.reference("voice_history").push(data)
+        if not success:
+            db.reference("action_failures").push({
+                "command": command,
+                "action_type": action_type,
+                "action_value": action_value,
+                "ai_response": ai_response,
+                "timestamp": int(time.time() * 1000)
+            })
     except Exception as e:
         print("[Voice History Error]:", e)
 
@@ -615,6 +700,11 @@ def on_screen_text_change(event):
 
     last_analyzed_screen_time = current_time
     last_analyzed_screen_text = screen_text
+
+    config = get_jarvis_config()
+    if not config.get("auto_screen_analysis", False):
+        return
+
     print(f"\n[Экран өзгерді, талдау басталуда]: {screen_text[:100]}...")
     
     # DeepSeek арқылы экранды талдау
@@ -667,12 +757,14 @@ def on_voice_command_change(event):
         # Support both string and dictionary formats for voice commands
         if isinstance(event.data, str):
             command = event.data.strip()
-            if command.lower() in ["", "none"]:
+            if command.lower() in ["", "none", "triggered"]:
                 return
             timestamp = int(time.time() * 1000)
         elif isinstance(event.data, dict):
             command = event.data.get("command", "").strip()
             timestamp = event.data.get("timestamp", 0)
+            if command.lower() in ["", "none", "triggered"]:
+                return
         else:
             return
 
@@ -1042,14 +1134,18 @@ def run_telegram_bot():
 # Бот пен веб-интерфейсті іске қосу
 if __name__ == "__main__":
     ensure_jarvis_config()
+    ensure_bot_config()
 
     # Өзін-өзі дамыту жоспарлаушысын іске қосу (Scheduler)
     scheduler_thread = threading.Thread(target=start_scheduler, daemon=True)
     scheduler_thread.start()
 
     # Телеграм ботты фонда қосу
-    bot_thread = threading.Thread(target=run_telegram_bot, daemon=True)
-    bot_thread.start()
+    if BOT_TOKEN:
+        bot_thread = threading.Thread(target=run_telegram_bot, daemon=True)
+        bot_thread.start()
+    else:
+        print("[Telegram Bot]: BOT_TOKEN орнатылмаған, бот іске қосылмайды.")
     
     # Шағын веб-интерфейс (Gradio) ашу, Hugging Face Spaces-ке қажет
     import gradio as gr
